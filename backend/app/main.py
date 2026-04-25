@@ -7,6 +7,7 @@ import os
 import json
 import shutil
 import uuid
+import whisper
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -15,12 +16,12 @@ from sqlalchemy.orm import Session
 from app.models import init_db, get_db, Recording, Analysis, ReplacementGoal, PracticeSession
 from app.analyzer import analyze_transcript
 
-app = FastAPI(title="LexiFlow", version="0.1.0")
+app = FastAPI(title="LexiFlow", version="0.2.0")
 
 # CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # Next.js / Vite
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,10 +30,17 @@ app.add_middleware(
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# Load Whisper model once at startup
+whisper_model = None
+
 
 @app.on_event("startup")
 def startup():
+    global whisper_model
     init_db()
+    print("Loading Whisper model (base)... this may take a moment on first run.")
+    whisper_model = whisper.load_model("base")
+    print("Whisper model loaded.")
 
 
 # ──────────────────────────────────────────────
@@ -40,8 +48,8 @@ def startup():
 # ──────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
-    transcript: str  # For MVP: user pastes transcript (Whisper integration later)
-    duration_seconds: float = 60.0
+    transcript: str | None = None
+    duration_seconds: float | None = None
 
 
 class GoalCreate(BaseModel):
@@ -72,26 +80,55 @@ async def upload_recording(file: UploadFile = File(...), db: Session = Depends(g
     db.commit()
     db.refresh(recording)
 
-    return {"id": recording.id, "audio_path": file_path, "message": "Uploaded. Call POST /recordings/{id}/analyze next."}
+    return {
+        "id": recording.id,
+        "audio_path": file_path,
+        "message": "Uploaded. Call POST /recordings/{id}/analyze next.",
+    }
 
 
 @app.post("/recordings/{recording_id}/analyze")
-def analyze_recording(recording_id: int, req: AnalyzeRequest, db: Session = Depends(get_db)):
+def analyze_recording(recording_id: int, req: AnalyzeRequest | None = None, db: Session = Depends(get_db)):
     """
-    Analyze a recording's transcript.
-    MVP: transcript is passed in the request body.
-    Future: auto-transcribe from audio via Whisper.
+    Analyze a recording. Two modes:
+    1. Auto-transcribe: call with no body or empty transcript — Whisper transcribes the audio
+    2. Manual: pass a transcript in the body to skip Whisper
     """
     recording = db.query(Recording).filter(Recording.id == recording_id).first()
     if not recording:
         raise HTTPException(status_code=404, detail="Recording not found")
 
-    # Save transcript to recording
-    recording.transcript = req.transcript
-    recording.duration_seconds = req.duration_seconds
+    transcript = None
+    duration_seconds = None
+
+    # Check if manual transcript was provided
+    if req and req.transcript and req.transcript.strip():
+        transcript = req.transcript
+        duration_seconds = req.duration_seconds or 60.0
+    else:
+        # Auto-transcribe with Whisper
+        if not os.path.exists(recording.audio_path):
+            raise HTTPException(status_code=400, detail="Audio file not found. Upload a real audio file to use auto-transcription.")
+
+        print(f"Transcribing {recording.audio_path} with Whisper...")
+        result = whisper_model.transcribe(recording.audio_path)
+        transcript = result["text"]
+
+        # Use last segment's end time for duration
+        if result.get("segments"):
+            duration_seconds = result["segments"][-1]["end"]
+        else:
+            duration_seconds = 60.0
+
+        print(f"Transcription complete: {len(transcript)} characters, {duration_seconds:.1f}s")
+
+    # Save to recording
+    recording.transcript = transcript
+    recording.duration_seconds = duration_seconds
+    db.commit()
 
     # Run analysis
-    results = analyze_transcript(req.transcript, req.duration_seconds)
+    results = analyze_transcript(transcript, duration_seconds)
 
     # Store analysis
     analysis = Analysis(
@@ -113,7 +150,7 @@ def analyze_recording(recording_id: int, req: AnalyzeRequest, db: Session = Depe
     return {
         "recording_id": recording_id,
         "analysis_id": analysis.id,
-        "transcript": req.transcript,
+        "transcript": transcript,
         "metrics": {
             "filler_count": results["filler_count"],
             "vocab_diversity": results["vocab_diversity"],
@@ -123,7 +160,7 @@ def analyze_recording(recording_id: int, req: AnalyzeRequest, db: Session = Depe
         },
         "filler_words": results["filler_words"],
         "top_repeated_words": results["top_repeated_words"],
-        "word_data": results["word_data"],  # visualization-ready
+        "word_data": results["word_data"],
     }
 
 
@@ -241,7 +278,6 @@ def get_progress(db: Session = Depends(get_db)):
             "total_words": analysis.total_words,
         })
 
-    # Summary: compare first vs last
     first = timeline[0]
     last = timeline[-1]
     summary = {
